@@ -1,0 +1,224 @@
+"""
+Gaussian approximation of a Gaussian-mixture posterior via three methods:
+  (i) Laplace (MAP + curvature)
+  (ii) argmin D_KL(π||ρ)  -> moment matching
+  (iii) argmin D_KL(ρ||π)  -> variational optimization with GH quadrature and score-function gradient
+
+Target posterior (normalized):
+    π(x) = 0.6 N(x|-1, 1) + 0.4 N(x|+1, 1)
+"""
+
+from __future__ import annotations
+import numpy as np
+from numpy.polynomial.hermite import hermgauss
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from pathlib import Path
+import os
+
+# Utilities & target density
+
+SQRT2PI = np.sqrt(2.0 * np.pi)
+
+def normal_pdf(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    return np.exp(-0.5 * ((x - mu) / sigma) ** 2) / (SQRT2PI * sigma)
+
+def log_normal_pdf(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    return -0.5 * np.log(2.0 * np.pi) - np.log(sigma) - 0.5 * ((x - mu) / sigma) ** 2
+
+# Mixture weights and parameters
+w1, m1, s1 = 0.6, -1.0, 1.0
+w2, m2, s2 = 0.4, +1.0, 1.0
+
+def pi_pdf(x: np.ndarray) -> np.ndarray:
+    return w1 * normal_pdf(x, m1, s1) + w2 * normal_pdf(x, m2, s2)
+
+def _logsumexp2(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    m = np.maximum(a, b)
+    return m + np.log(np.exp(a - m) + np.exp(b - m))
+
+def log_pi(x: np.ndarray) -> np.ndarray:
+    a = np.log(w1) + log_normal_pdf(x, m1, s1)
+    b = np.log(w2) + log_normal_pdf(x, m2, s2)
+    return _logsumexp2(a, b)
+
+# Unnormalized mixture for Laplace derivatives (constants drop out)
+def M(x: np.ndarray | float) -> np.ndarray | float:
+    return 6.0 * np.exp(-0.5 * (x + 1.0) ** 2) + 4.0 * np.exp(-0.5 * (x - 1.0) ** 2)
+
+def Mprime(x: np.ndarray | float) -> np.ndarray | float:
+    return -6.0 * (x + 1.0) * np.exp(-0.5 * (x + 1.0) ** 2) - 4.0 * (x - 1.0) * np.exp(-0.5 * (x - 1.0) ** 2)
+
+def Mdoubleprime(x: np.ndarray | float) -> np.ndarray | float:
+    return 6.0 * ((x + 1.0) ** 2 - 1.0) * np.exp(-0.5 * (x + 1.0) ** 2) + 4.0 * ((x - 1.0) ** 2 - 1.0) * np.exp(-0.5 * (x - 1.0) ** 2)
+
+# (i) Laplace approximation: argmin D_KL(π||ρ) via MAP + curvature
+
+def laplace_fit() -> tuple[float, float]:
+    """
+    Return (mu, sigma) from Laplace approx:
+      mu = MAP(π),   sigma^2 = -1 / l''(mu), with l = log M up to a constant.
+    """
+    xs = np.linspace(-5, 5, 20001)
+    x = xs[np.argmax(np.log(M(xs)))]  # robust coarse guess
+
+    # Newton's method on M'(x) = 0 with safeguard
+    for _ in range(20):
+        g = Mprime(x)
+        h = Mdoubleprime(x)
+        if h == 0:
+            break
+        step = -g / h
+        # guard extremely large jumps
+        if abs(step) > 1.0:
+            step = np.sign(step) * 1.0
+        x_new = x + step
+        if not np.isfinite(x_new) or abs(step) < 1e-12:
+            x = x_new
+            break
+        x = x_new
+
+    mu = float(x)
+    lpp = Mdoubleprime(mu) / M(mu)         # l''(mu) = M''(mu)/M(mu)
+    sigma2 = -1.0 / lpp                    # curvature → variance
+    sigma = float(np.sqrt(sigma2))
+    return mu, sigma
+
+# (ii) KL: argmin D_KL(π||ρ) (moments) 
+
+def forward_KL_fit() -> tuple[float, float]:
+    """Moment matching for the Gaussian family."""
+    mu = w1 * m1 + w2 * m2
+    Ex2 = w1 * (m1**2 + s1**2) + w2 * (m2**2 + s2**2)
+    var = Ex2 - mu**2
+    return float(mu), float(np.sqrt(var))
+
+# (iii) KL: argmin D_KL(ρ||π) via Gauss-Hermite (GH) quadrature
+
+def gh_expect_under_rho(f, mu: float, sigma: float, n: int = 200) -> float: # compute E_ρ[f(X)]
+    """
+    E_ρ[f(X)] where ρ = N(mu, sigma^2), using n-point Gauss-Hermite quadrature.
+    Transformation: X = mu + sigma * sqrt(2) * Y, with Y ~ standard GH nodes.
+    """
+    y, w = hermgauss(n)
+    pts = mu + sigma * np.sqrt(2.0) * y
+    vals = f(pts)
+    return float((w @ vals) / np.sqrt(np.pi))
+
+def KL_rho_pi(mu: float, sigma: float, n: int = 200) -> float: # compute D_KL(ρ||π)
+    """D_KL(ρ||π) = E_ρ[log ρ - log π]."""
+    def g(x): return log_normal_pdf(x, mu, sigma) - log_pi(x)
+    return gh_expect_under_rho(g, mu, sigma, n=n)
+
+def KL_pi_rho(mu: float, sigma: float, n: int = 200) -> float: # compute D_KL(π||ρ)
+    """D_KL(π||ρ) computed as mixture of expectations under N(-1,1) and N(+1,1)."""
+    y, w = hermgauss(n)
+
+    def E_m1(f, m):
+        pts = m + np.sqrt(2.0) * y
+        vals = f(pts)
+        return (w @ vals) / np.sqrt(np.pi)
+
+    def f(x): return log_pi(x) - log_normal_pdf(x, mu, sigma)
+    return float(w1 * E_m1(f, m1) + w2 * E_m1(f, m2))
+
+def grad_KL_rho_pi(mu: float, sigma: float, n: int = 200) -> tuple[float, float]:
+    """
+    Gradients of D_KL(ρ||π) via score-function identity:
+      ∂θ KL = E_ρ[ (s_μ(x),s_σ(x)) ( log ρ(X) - log π(X) + 1 ) ]
+    with s_μ=(x-μ)/σ^2,  s_σ= -1/σ + (x-μ)^2/σ^3.
+    """
+    y, w = hermgauss(n)
+    pts = mu + sigma * np.sqrt(2.0) * y
+    log_rho = log_normal_pdf(pts, mu, sigma)
+    u = log_rho - log_pi(pts) + 1.0
+    s_mu = (pts - mu) / (sigma ** 2)
+    s_sigma = -1.0 / sigma + (pts - mu) ** 2 / (sigma ** 3)
+    fac = w / np.sqrt(np.pi)
+    dmu = float(np.sum(fac * s_mu * u))
+    dsigma = float(np.sum(fac * s_sigma * u))
+    return dmu, dsigma
+
+def reverse_KL_fit(mu0: float = -1.0, sigma0: float = 1.0,
+                     n: int = 200, maxit: int = 200, tol: float = 1e-10) -> tuple[float, float]:
+    """Gradient descent with backtracking line-search on D_KL(ρ||π)."""
+    mu, sigma = float(mu0), float(sigma0)
+    for _ in range(maxit):
+        dmu, dsigma = grad_KL_rho_pi(mu, sigma, n=n)
+        gn = np.hypot(dmu, dsigma) # equivalent to norm of gradient
+        if gn < tol:
+            break
+
+        base = KL_rho_pi(mu, sigma, n=n)
+        step = 1.0
+        for _ in range(20):
+            mu_new = mu - step * dmu
+            sigma_new = max(1e-6, sigma - step * dsigma)
+            val_new = KL_rho_pi(mu_new, sigma_new, n=n)
+            if np.isfinite(val_new) and val_new < base:
+                mu, sigma = mu_new, sigma_new
+                break
+            step *= 0.5
+        else:
+            # no sufficient decrease
+            break
+    return float(mu), float(sigma)
+
+# plotting
+
+@dataclass
+class FitResult:
+    name: str
+    mu: float
+    sigma: float
+    KL_pi_rho: float
+    KL_rho_pi: float
+
+def run_and_plot(make_plot: bool = True) -> list[FitResult]:
+    # compute fits
+    mu_lap, sig_lap = laplace_fit()
+    mu_inc, sig_inc = forward_KL_fit()
+    mu_exc, sig_exc = reverse_KL_fit()
+
+    methods = {
+        "Laplace": (mu_lap, sig_lap),
+        "Moment (KL π||ρ)": (mu_inc, sig_inc),
+        "VB (KL ρ||π)": (mu_exc, sig_exc),
+    }
+
+    # evaluate divergences
+    results: list[FitResult] = []
+    for name, (m, s) in methods.items():
+        k1 = KL_pi_rho(m, s, n=200)
+        k2 = KL_rho_pi(m, s, n=200)
+        results.append(FitResult(name, m, s, k1, k2))
+
+    # optional plot
+    if make_plot:
+        xs = np.linspace(-4, 4, 2000)
+        plt.figure()
+        plt.plot(xs, pi_pdf(xs), label=r"$\pi(x)$")
+        for r in results:
+            plt.plot(xs, normal_pdf(xs, r.mu, r.sigma),
+                     label=f"{r.name}: N({r.mu:.3f}, {r.sigma**2:.3f})")
+        plt.xlabel("x"); plt.ylabel("density")
+        plt.title("Gaussian approximations to a Gaussian-mixture posterior")
+        plt.legend()
+        plt.tight_layout()
+
+        outdir = Path("figs")
+        if os.path.isdir("/mnt/data"):
+            outdir = Path("/mnt/data")
+        outdir.mkdir(parents=True, exist_ok=True)
+        plt.savefig(outdir / "kl_gaussian_approximations.png")
+        print("Saved figure to:", (outdir / "kl_gaussian_approximations.png").resolve())
+
+    # print table
+    print("Approximations (μ, σ,  KL(π||ρ),   KL(ρ||π))")
+    for r in results:
+        print(f"{r.name:>18s}: mu={r.mu: .6f}, sigma={r.sigma: .6f}, "
+              f"KL(π||ρ)={r.KL_pi_rho: .6f}, KL(ρ||π)={r.KL_rho_pi: .6f}")
+    return results
+
+if __name__ == "__main__":
+    run_and_plot(make_plot=True)
