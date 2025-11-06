@@ -1,0 +1,150 @@
+# Deblurring in 1D with TSVD, Tikhonov, and L-curve
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+np.random.seed(7)
+
+N = 200               # discretization points
+c = 0.2               # kernel width
+sigma_noise = 0.05    # noise std
+
+# Midpoint grid on (0,1)
+i = np.arange(N)
+x = (i + 0.5)/N
+h = 1.0/N
+
+def triangular_kernel(xdiff, c):
+    return (1.0 / (c**2)) * np.maximum(0.0, c - np.abs(xdiff))
+
+def build_kernel_matrix(x, c, h): # returns K where K_ij = K(x_i, x_j)
+    X1 = x[:, None]
+    X2 = x[None, :]
+    return triangular_kernel(X1 - X2, c) * h # returns (N,N) matrix
+
+def p_true_fn(x): # true signal function
+    p = np.zeros_like(x)
+    p[(0.1 < x) & (x <= 0.25)] = 1.0
+    p[(0.25 < x) & (x <= 0.4)] = 0.25
+    mask = (0.5 < x) & (x <= 1.0)
+    p[mask] = np.sin(2.0*np.pi*x[mask])**4
+    return p 
+
+K = build_kernel_matrix(x, c, h) # forward operator
+p_true = p_true_fn(x)
+d_clean = K @ p_true
+d = d_clean + sigma_noise * np.random.randn(N)
+
+# SVD
+U, s, Vt = np.linalg.svd(K, full_matrices=False)
+
+def solve_tsvd(U, s, Vt, d, alpha): # truncated SVD solution
+    y = U.T @ d
+    filt = np.where(s >= alpha, 1.0/s, 0.0)
+    return Vt.T @ (filt * y)
+
+def solve_tikhonov_zero(U, s, Vt, d, alpha): # zero-order Tikhonov solution
+    y = U.T @ d
+    phi = s / (s**2 + alpha**2)
+    return Vt.T @ (phi * y)
+
+def lcurve_tikhonov(K, U, s, Vt, d, alphas): # L-curve computation for Tikhonov
+    xs, ys, Ps = [], [], []
+    for a in alphas: # for each alpha, compute solution and norms
+        p = solve_tikhonov_zero(U, s, Vt, d, a)
+        Ps.append(p)
+        r = K @ p - d
+        xs.append(np.log(np.linalg.norm(r)))
+        ys.append(np.log(np.linalg.norm(p)))
+    xs, ys = np.asarray(xs), np.asarray(ys)
+    t = np.log(alphas)
+
+    def deriv(z): # numerical first derivative
+        dz = np.empty_like(z)
+        dz[1:-1] = (z[2:] - z[:-2]) / (t[2:] - t[:-2])
+        dz[0] = (z[1] - z[0]) / (t[1] - t[0])
+        dz[-1] = (z[-1] - z[-2]) / (t[-1] - t[-2])
+        return dz
+
+    def second_deriv(z): # numerical second derivative
+        d1 = deriv(z)
+        d2 = np.empty_like(z)
+        d2[1:-1] = (d1[2:] - d1[:-2]) / (t[2:] - t[:-2])
+        d2[0] = (d1[1] - d1[0]) / (t[1] - t[0])
+        d2[-1] = (d1[-1] - d1[-2]) / (t[-1] - t[-2])
+        return d2
+
+    x1, y1 = deriv(xs), deriv(ys)
+    x2, y2 = second_deriv(xs), second_deriv(ys)
+    curvature = np.abs(x1 * y2 - y1 * x2) / np.power(x1**2 + y1**2, 1.5)
+
+    idx_star = np.argmax(curvature[1:-1]) + 1  # avoid endpoints
+    alpha_star = alphas[idx_star]
+    return xs, ys, curvature, alpha_star, idx_star, Ps
+
+# (a) TSVD
+alphas_main = np.array([1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0])
+p_tsvd_list = [solve_tsvd(U, s, Vt, d, a) for a in alphas_main]
+
+# (b) Tikhonov
+p_tikh_list = [solve_tikhonov_zero(U, s, Vt, d, a) for a in alphas_main]
+
+# (c) L-curve
+alphas_lc = np.array([1e-6 * (1.3**i) for i in range(41)])
+xs, ys, curv, alpha_star, idx_star, p_list_lc = lcurve_tikhonov(K, U, s, Vt, d, alphas_lc)
+
+# (d) Error vs alpha (Tikhonov)
+errs = np.array([np.linalg.norm(p_true - solve_tikhonov_zero(U, s, Vt, d, a)) for a in alphas_lc])
+alpha_errmin = alphas_lc[np.argmin(errs)]
+
+# plots, one figure per chart
+plt.figure()
+plt.plot(x, p_true, label="p_true")
+plt.plot(x, d, label="d (blurred + noise)")
+plt.xlabel("x"); plt.ylabel("value"); plt.title("True signal vs. blurred & noisy data")
+plt.legend(); plt.tight_layout(); plt.show()
+
+
+plt.figure()
+plt.plot(x, p_true, linewidth=2, label="p_true")
+for a, p in zip(alphas_main, p_tsvd_list):
+    plt.plot(x, p, label=f"TSVD α={a:g}")
+plt.xlabel("x"); plt.ylabel("p(x)"); plt.title("TSVD reconstructions (various α)")
+plt.legend(loc="best", ncol=2); plt.tight_layout(); plt.show()
+
+
+plt.figure()
+plt.plot(x, p_true, linewidth=2, label="p_true")
+for a, p in zip(alphas_main, p_tikh_list):
+    plt.plot(x, p, label=f"Tikhonov α={a:g}")
+plt.xlabel("x"); plt.ylabel("p(x)"); plt.title("Tikhonov reconstructions (various α)")
+plt.legend(loc="best", ncol=2); plt.tight_layout(); plt.show()
+
+
+plt.figure()
+plt.plot(xs, ys, marker="o")
+plt.plot(xs[idx_star], ys[idx_star], marker="x", markersize=10, linestyle="None",
+         label=f"max curvature α≈{alpha_star:.3e}")
+plt.xlabel("log ||K pα - d||₂"); plt.ylabel("log ||pα||₂"); plt.title("L-curve for Tikhonov")
+plt.legend(); plt.tight_layout(); plt.show()
+
+
+plt.figure()
+plt.plot(np.log(alphas_lc), curv, marker="o")
+plt.axvline(np.log(alpha_star), linestyle="--", label=f"α*≈{alpha_star:.3e}")
+plt.xlabel("log α"); plt.ylabel("curvature"); plt.title("L-curve curvature (Tikhonov)")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure()
+plt.semilogx(alphas_lc, errs, marker="o")
+plt.axvline(alpha_star, linestyle="--", label=f"L-curve α*≈{alpha_star:.3e}")
+plt.axvline(alpha_errmin, linestyle=":", label=f"α minimizing error≈{alpha_errmin:.3e}")
+plt.xlabel("α (log scale)"); plt.ylabel("||p_true - pα||₂"); plt.title("Tikhonov: reconstruction error vs α")
+plt.legend(); plt.tight_layout(); plt.show()
+
+p_lcurve_best = solve_tikhonov_zero(U, s, Vt, d, alpha_star)
+plt.figure()
+plt.plot(x, p_true, label="p_true")
+plt.plot(x, p_lcurve_best, label=f"Tikhonov (α*≈{alpha_star:.3e})")
+plt.xlabel("x"); plt.ylabel("p(x)"); plt.title("Best Tikhonov (by L-curve) vs truth")
+plt.legend(); plt.tight_layout(); plt.show()
