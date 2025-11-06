@@ -1,0 +1,99 @@
+# Wasserstein distance demo for shifted sine densities
+# (b): p(x) = 1 + 0.5 sin(2πx), p_a(x) = p(x+a)
+# (c): ρ(x) = 1 + sin(2πx), ρ_a(x) = ρ(x+a)   (shifted & nonnegative)
+# Distances plotted as functions of shift a ∈ [-2, 2]:
+#   * L2 distance
+#   * Total Variation (TV) distance
+#   * W2 on the circle 𝕋: W2^circle(p, p_a) = min_{k∈ℤ} |a - k|
+#   * W2 on the line ℝ:   W2^line(p, p_a)   = |a|
+#
+# Uses only numpy and matplotlib (one plot per figure).
+
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+
+# output directory
+OUTPUT_DIR = Path("figs")         # filepath to save figures
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# closed-form distances, computed by hand and then implemented here
+def L2_closed(a, A):
+    """Closed-form L2 distance between 1 + A sin(2πx) and its shift by a (periodic)."""
+    return np.sqrt(2) * A * np.abs(np.sin(np.pi * a))
+
+def TV_closed(a, A):
+    """Closed-form TV distance between 1 + A sin(2πx) and its shift by a (periodic)."""
+    return (2 * A / np.pi) * np.abs(np.sin(np.pi * a))
+
+def W2_circle(a):
+    """Geodesic distance on the unit circle (period 1).""" # Metric to use in W_2 was unspecified, I saw this in a paper
+    return np.abs(a - np.round(a))
+
+def W2_line(a):
+    """Linear translation distance on ℝ."""
+    return np.abs(a)
+
+# numerical integrals for L2 and TV sanity checks
+def p_periodic(x, A):
+    """p(x) = 1 + A sin(2πx), extended periodically for any real x."""
+    return 1.0 + A * np.sin(2.0 * np.pi * (x % 1.0))
+
+def L2_numeric(a, A, ngrid=20000):
+    xs = np.linspace(0.0, 1.0, ngrid, endpoint=False)
+    diff = p_periodic(xs, A) - p_periodic(xs + a, A)
+    return np.sqrt(np.trapezoid(diff**2, xs))
+
+def TV_numeric(a, A, ngrid=20000):
+    xs = np.linspace(0.0, 1.0, ngrid, endpoint=False)
+    diff = np.abs(p_periodic(xs, A) - p_periodic(xs + a, A))
+    return 0.5 * np.trapezoid(diff, xs)
+
+# (b): A = 0.5 
+A_b = 0.5
+a_vals = np.linspace(-2, 2, 2001)
+
+L2_b = L2_closed(a_vals, A_b)
+TV_b = TV_closed(a_vals, A_b)
+W2c_b = W2_circle(a_vals)
+W2l_b = W2_line(a_vals)
+
+# sanity check at a few points
+a_test = np.linspace(-1.0, 1.0, 9)
+L2_num_b = np.array([L2_numeric(a, A_b) for a in a_test])
+TV_num_b = np.array([TV_numeric(a, A_b) for a in a_test])
+print("Part (b) max |L2 numeric - closed|:", np.max(np.abs(L2_num_b - L2_closed(a_test, A_b))))
+print("Part (b) max |TV numeric - closed|:", np.max(np.abs(TV_num_b - TV_closed(a_test, A_b))))
+
+plt.figure()
+plt.plot(a_vals, L2_b, label=r"$\|p-p_a\|_2$")
+plt.plot(a_vals, TV_b, label=r"$D_{\rm TV}(p,p_a)$")
+plt.plot(a_vals, W2c_b, label=r"$W_2^{\rm circle}(p,p_a)$")
+plt.plot(a_vals, W2l_b, label=r"$W_2^{\rm line}(p,p_a)$")
+plt.xlabel("shift a"); plt.ylabel("distance"); plt.title("Part (b): distances vs shift (A=0.5)")
+plt.legend(); plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "wasserstein_part_b.png")
+
+# (c): A = 1.0 (after positivity shift)
+A_c = 1.0
+L2_c = L2_closed(a_vals, A_c)
+TV_c = TV_closed(a_vals, A_c)
+W2c_c = W2_circle(a_vals)
+W2l_c = W2_line(a_vals)
+
+L2_num_c = np.array([L2_numeric(a, A_c) for a in a_test])
+TV_num_c = np.array([TV_numeric(a, A_c) for a in a_test])
+print("Part (c) max |L2 numeric - closed|:", np.max(np.abs(L2_num_c - L2_closed(a_test, A_c))))
+print("Part (c) max |TV numeric - closed|:", np.max(np.abs(TV_num_c - TV_closed(a_test, A_c))))
+
+plt.figure()
+plt.plot(a_vals, L2_c, label=r"$\|\rho-\rho_a\|_2$")
+plt.plot(a_vals, TV_c, label=r"$D_{\rm TV}(\rho,\rho_a)$")
+plt.plot(a_vals, W2c_c, label=r"$W_2^{\rm circle}(\rho,\rho_a)$")
+plt.plot(a_vals, W2l_c, label=r"$W_2^{\rm line}(\rho,\rho_a)$")
+plt.xlabel("shift a"); plt.ylabel("distance"); plt.title("Part (c): distances vs shift (A=1.0)")
+plt.legend(); plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "wasserstein_part_c.png")
+
+print("Saved to:", OUTPUT_DIR.resolve())
