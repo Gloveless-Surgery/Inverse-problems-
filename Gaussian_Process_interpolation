@@ -1,0 +1,113 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Squared–exponential kernel
+def rbf_kernel(x1, x2, ell, sigma_f):
+    #Squared exponential kernel:
+    #k(x, x') = sigma_f^2 * exp(-(x-x')^2 / (2*ell^2))
+    #x1: (N,) array
+    #x2: (M,) array
+    #returns: (N,M) covariance matrix
+
+    x1 = x1[:, None]     # shape (N,1)
+    x2 = x2[None, :]     # shape (1,M)
+    sqdist = (x1 - x2) ** 2
+    return sigma_f**2 * np.exp(-0.5 * sqdist / ell**2)
+
+
+# GP posterior (mean & std)
+def gp_posterior(x_train, y_train, x_test, ell, sigma_f, eps):
+    #Computes posterior mean and std of GP at x_test.
+    #x_train: (N,)
+    #y_train: (N,)
+    #x_test:  (M,)
+    #ell, sigma_f, eps: hyperparameters
+
+    # Covariance matrices
+    K = rbf_kernel(x_train, x_train, ell, sigma_f)  # (N,N)
+    K_y = K + eps**2 * np.eye(len(x_train))         # add noise variance
+    K_s = rbf_kernel(x_train, x_test, ell, sigma_f) # (N,M)
+    K_ss = rbf_kernel(x_test, x_test, ell, sigma_f) # (M,M)
+
+    # Cholesky solve
+    L = np.linalg.cholesky(K_y + 1e-10 * np.eye(len(x_train)))
+    # alpha = K_y^{-1} y via two triangular solves
+    alpha = np.linalg.solve(L.T, np.linalg.solve(L, y_train))
+
+    # Posterior mean
+    mu = K_s.T @ alpha                                # (M,)
+
+    # Posterior covariance: K_ss - K_s^T K_y^{-1} K_s
+    v = np.linalg.solve(L, K_s)                       # (N,M)
+    cov = K_ss - v.T @ v                              # (M,M)
+    std = np.sqrt(np.maximum(np.diag(cov), 0.0))      # numerical safety
+
+    return mu, std
+
+
+# 1. Generate training data from a 1D GP with given parameters
+
+#np.random.seed(0)
+
+ell_true, sigma_f_true, eps_true = 1.0, 1.0, 0.1
+
+N = 20
+x_train = np.random.uniform(-8.0, 8.0, size=N)
+x_train = np.sort(x_train)  # sorting for nicer plots
+
+# Covariance of latent function at training points
+K_true = rbf_kernel(x_train, x_train, ell_true, sigma_f_true)
+
+# Sample latent function f ~ N(0, K_true)
+f_train = np.random.multivariate_normal(
+    mean=np.zeros(N), cov=K_true
+)
+
+# Add Gaussian observation noise N(0, eps_true^2)
+y_train = f_train + eps_true * np.random.randn(N)
+
+
+# 2. Prediction grid
+
+x_test = np.linspace(-8.0, 8.0, 400)
+
+# 3. Use three different hyperparameter settings
+
+param_sets = [
+    (1.0, 1.0, 0.1),
+    (0.3, 1.08, 5e-5),
+    (3.0, 1.16, 0.89),
+]
+
+titles = [
+    r"$(\ell,\sigma_f,\epsilon) = (1.0, 1.0, 0.1)$",
+    r"$(\ell,\sigma_f,\epsilon) = (0.3, 1.08, 5\cdot 10^{-5})$",
+    r"$(\ell,\sigma_f,\epsilon) = (3.0, 1.16, 0.89)$",
+]
+
+plt.figure(figsize=(8, 10))
+
+for i, (ell, sigma_f, eps) in enumerate(param_sets, start=1):
+    mu, std = gp_posterior(x_train, y_train, x_test, ell, sigma_f, eps)
+
+    plt.subplot(3, 1, i)
+    # 95% confidence interval: mean ± 1.96 * std
+    plt.fill_between(
+        x_test,
+        mu - 1.96 * std,
+        mu + 1.96 * std,
+        alpha=0.2,
+        label="95% CI",
+    )
+    plt.plot(x_test, mu, label="Predictive mean")
+    plt.scatter(x_train, y_train, c="k", marker="x", label="Data")
+
+    plt.title(titles[i - 1])
+    plt.xlim(-8, 8)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    if i == 1:
+        plt.legend(loc="upper left")
+
+plt.tight_layout()
+plt.show()
